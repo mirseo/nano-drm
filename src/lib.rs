@@ -1,17 +1,19 @@
-use pyo3::prelude::*;
+use pyo3::prelude::*
 use pyo3::types::PyBytes;
 use reed_solomon_erasure::{galois_8, ReedSolomon, Error as RSError};
-use image::{ImageBuffer, Rgba};
+use image::{ImageBuffer, Rgba, Luma};
+use lopdf::{Document, Object, Dictionary, Stream, content::{Content, Operation}, ObjectId};
 use std::io::Cursor;
 use std::fs;
 
-// ... (DrmError enum and From implementations - unchanged) ...
+// ... (DrmError, From impls, FileType, detect_file_type are unchanged) ...
 #[derive(Debug)]
 enum DrmError {
     Io(std::io::Error),
     Py(PyErr),
     Rs(RSError),
     Image(image::ImageError),
+    Pdf(lopdf::Error),
     Message(String),
 }
 
@@ -19,6 +21,7 @@ impl From<std::io::Error> for DrmError { fn from(err: std::io::Error) -> DrmErro
 impl From<PyErr> for DrmError { fn from(err: PyErr) -> DrmError { DrmError::Py(err) } }
 impl From<RSError> for DrmError { fn from(err: RSError) -> DrmError { DrmError::Rs(err) } }
 impl From<image::ImageError> for DrmError { fn from(err: image::ImageError) -> DrmError { DrmError::Image(err) } }
+impl From<lopdf::Error> for DrmError { fn from(err: lopdf::Error) -> DrmError { DrmError::Pdf(err) } }
 
 impl From<DrmError> for PyErr {
     fn from(err: DrmError) -> PyErr {
@@ -27,12 +30,28 @@ impl From<DrmError> for PyErr {
             DrmError::Py(e) => e,
             DrmError::Rs(e) => PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Reed-Solomon error: {:?}", e)),
             DrmError::Image(e) => PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Image processing error: {}", e)),
+            DrmError::Pdf(e) => PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("PDF processing error: {}", e)),
             DrmError::Message(s) => PyErr::new::<pyo3::exceptions::PyValueError, _>(s),
         }
     }
 }
 
-// ... (embed_in_png and extract_from_png are internal helpers, names unchanged) ...
+enum FileType {
+    Png,
+    Pdf,
+    Unsupported,
+}
+
+fn detect_file_type(data: &[u8]) -> FileType {
+    if data.len() > 8 && &data[0..8] == b"\x89PNG\r\n\x1a\n" {
+        FileType::Png
+    } else if data.len() > 4 && &data[0..4] == b"%PDF" {
+        FileType::Pdf
+    } else {
+        FileType::Unsupported
+    }
+}
+
 fn embed_in_png(image_data: &[u8], data_to_embed: &[u8]) -> Result<Vec<u8>, DrmError> {
     let mut img = image::load_from_memory(image_data)?.to_rgba8();
     let capacity = img.as_raw().len();
@@ -92,13 +111,105 @@ fn extract_from_png(image_data: &[u8]) -> Result<Vec<u8>, DrmError> {
     Ok(payload)
 }
 
+fn embed_in_pdf(pdf_data: &[u8], data_to_embed: &[u8]) -> Result<Vec<u8>, DrmError> {
+    let mut doc = Document::load_mem(pdf_data)?;
 
-/// Writes data into a file, overwriting it.
+    // 1. Create noise image
+    let side = (data_to_embed.len() as f64).sqrt().ceil() as u32;
+    let noise_img_buffer: ImageBuffer<Luma<u8>, _> = ImageBuffer::from_fn(side, side, |x, y| {
+        let index = (y * side + x) as usize;
+        Luma([if index < data_to_embed.len() { data_to_embed[index] } else { 0 }])
+    });
+    let mut noise_png_bytes = vec![];
+    noise_img_buffer.write_to(&mut Cursor::new(&mut noise_png_bytes), image::ImageOutputFormat::Png)?;
+
+    // 2. Create Image XObject
+    let image_xobject = Stream::new(
+        Dictionary::from_iter(vec![
+            (b"Type".to_vec(), Object::Name(b"XObject".to_vec())),
+            (b"Subtype".to_vec(), Object::Name(b"Image".to_vec())),
+            (b"Width".to_vec(), Object::Integer(side as i64)),
+            (b"Height".to_vec(), Object::Integer(side as i64)),
+            (b"ColorSpace".to_vec(), Object::Name(b"DeviceGray".to_vec())),
+            (b"BitsPerComponent".to_vec(), Object::Integer(8)),
+            (b"Filter".to_vec(), Object::Name(b"FlateDecode".to_vec())),
+        ]),
+        noise_png_bytes,
+    );
+    let image_id = doc.add_object(image_xobject);
+
+    // 3. Create Graphics State dictionary for transparency
+    let gs_dict = Dictionary::from_iter(vec![(b"ca".to_vec(), Object::Real(0.01))]);
+    let gs_id = doc.add_object(gs_dict);
+
+    // 4. Iterate over pages and add the image
+    let page_ids = doc.get_pages().values().cloned().collect::<Vec<ObjectId>>();
+    for page_id in page_ids {
+        let resources_id = {
+            let page_dict = doc.get_object(page_id)?.as_dict()?;
+            match page_dict.get(b"Resources") {
+                Ok(Object::Reference(id)) => *id,
+                _ => {
+                    let new_res_id = doc.add_object(Dictionary::new());
+                    doc.get_object_mut(page_id)?.as_dict_mut()?.set(b"Resources", new_res_id);
+                    new_res_id
+                }
+            }
+        };
+
+        {
+            let resources = doc.get_object_mut(resources_id)?.as_dict_mut()?;
+            let xobject_id = match resources.get(b"XObject") {
+                Ok(Object::Reference(id)) => *id,
+                _ => {
+                    let new_id = doc.add_object(Dictionary::new());
+                    resources.set(b"XObject", new_id);
+                    new_id
+                }
+            };
+            let gstate_id = match resources.get(b"ExtGState") {
+                Ok(Object::Reference(id)) => *id,
+                _ => {
+                    let new_id = doc.add_object(Dictionary::new());
+                    resources.set(b"ExtGState", new_id);
+                    new_id
+                }
+            };
+            doc.get_object_mut(xobject_id)?.as_dict_mut()?.set(b"UpdrmImg", image_id);
+            doc.get_object_mut(gstate_id)?.as_dict_mut()?.set(b"UpdrmGS", gs_id);
+        }
+
+        let content_ops = vec![
+            Operation::new("q", vec![]),
+            Operation::new("gs", vec![Object::Name(b"UpdrmGS".to_vec())]),
+            Operation::new("cm", vec![10.0.into(), 0.into(), 0.into(), 10.0.into(), 50.into(), 50.into()]),
+            Operation::new("Do", vec![Object::Name(b"UpdrmImg".to_vec())]),
+            Operation::new("Q", vec![]),
+        ];
+        let new_content_stream = Stream::new(Dictionary::new(), Content { operations: content_ops }.encode()?);
+        let new_content_id = doc.add_object(new_content_stream);
+
+        let page_dict = doc.get_object_mut(page_id)?.as_dict_mut()?;
+        let mut contents_array = match page_dict.get(b"Contents") {
+            Ok(Object::Reference(id)) => vec![Object::Reference(*id)],
+            Ok(Object::Array(arr)) => arr.clone(),
+            _ => vec![],
+        };
+        contents_array.push(Object::Reference(new_content_id));
+        page_dict.set(b"Contents", Object::Array(contents_array));
+    }
+
+    let mut result_bytes = Vec::new();
+    doc.save_to(&mut result_bytes)?;
+    Ok(result_bytes)
+}
+
+
+// ... (write and read functions are unchanged) ...
 #[pyfunction]
 fn write(py: Python, file_path: String, data: &Bound<'_, PyAny>) -> Result<(), DrmError> {
     let _ = py;
 
-    // Automatically detect if data is string or bytes
     let raw_data: Vec<u8> = if let Ok(text) = data.extract::<String>() {
         text.into_bytes()
     } else if let Ok(bytes) = data.extract::<Vec<u8>>() {
@@ -126,27 +237,28 @@ fn write(py: Python, file_path: String, data: &Bound<'_, PyAny>) -> Result<(), D
 
     let original_file_bytes = fs::read(&file_path)?;
     
-    let modified_file_bytes = if file_path.to_lowercase().ends_with(".png") {
-        embed_in_png(&original_file_bytes, &final_payload)?
-    } else {
-        return Err(DrmError::Message("Unsupported file type. Only .png is supported.".to_string()));
+    let file_type = detect_file_type(&original_file_bytes);
+
+    let modified_file_bytes = match file_type {
+        FileType::Png => embed_in_png(&original_file_bytes, &final_payload)?,
+        FileType::Pdf => embed_in_pdf(&original_file_bytes, &final_payload)?,
+        FileType::Unsupported => return Err(DrmError::Message("Unsupported file type. Only PNG and PDF are supported.".to_string())),
     };
 
-    // Overwrite the original file
     fs::write(&file_path, &modified_file_bytes)?;
 
     Ok(())
 }
 
-/// Reads data from a file.
 #[pyfunction]
 fn read(py: Python, file_path: String) -> Result<PyObject, DrmError> {
     let file_bytes = fs::read(&file_path)?;
+    let file_type = detect_file_type(&file_bytes);
 
-    let encoded_data = if file_path.to_lowercase().ends_with(".png") {
-        extract_from_png(&file_bytes)?
-    } else {
-        return Err(DrmError::Message("Unsupported file type for extraction.".to_string()));
+    let encoded_data = match file_type {
+        FileType::Png => extract_from_png(&file_bytes)?,
+        FileType::Pdf => return Err(DrmError::Message("PDF extraction is not yet implemented.".to_string())),
+        FileType::Unsupported => return Err(DrmError::Message("Unsupported file type for extraction.".to_string())),
     };
 
     const DATA_SHARDS: usize = 10;
@@ -174,7 +286,6 @@ fn read(py: Python, file_path: String) -> Result<PyObject, DrmError> {
 }
 
 
-/// A Python module for nano-drm implemented in Rust.
 #[pymodule]
 fn mirseo_updrm(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(write, m)?)?;

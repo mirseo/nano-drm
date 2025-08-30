@@ -54,7 +54,7 @@ def run_test():
     finally:
         # 6. Clean up the test file
         if os.path.exists(test_path):
-            os.remove(test_path)
+            # os.remove(test_path)
             print(f"\nCleaned up temporary file: {test_path}")
 
 if __name__ == "__main__":
