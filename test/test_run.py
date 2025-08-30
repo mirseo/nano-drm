@@ -53,9 +53,9 @@ def run_test():
         print(f"\n--- An error occurred during the test: {e} ---")
     finally:
         # 6. Clean up the test file
-        if os.path.exists(test_path):
-            # os.remove(test_path)
-            print(f"\nCleaned up temporary file: {test_path}")
+        # if os.path.exists(test_path):
+        #     # os.remove(test_path)
+        #     print(f"Cleaned up temporary file: {test_path}")
 
 if __name__ == "__main__":
     run_test()
