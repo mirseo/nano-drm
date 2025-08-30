@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "mirseo_updrm"
+name = "nano_drm"
 crate-type = ["cdylib"]
 
 [dependencies]

@@ -421,7 +421,7 @@ fn read(py: Python, file_path: String) -> Result<PyObject, DrmError> {
 }
 
 #[pymodule]
-fn mirseo_updrm(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn nano_drm(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(write, m)?)?;
     m.add_function(wrap_pyfunction!(read, m)?)?;
     Ok(())
