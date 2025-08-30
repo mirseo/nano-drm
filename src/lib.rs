@@ -1,10 +1,13 @@
-use pyo3::prelude::*
+use image::{ImageBuffer, Luma, Rgba};
+use lopdf::{
+    content::{Content, Operation},
+    Dictionary, Document, Object, ObjectId, Stream,
+};
+use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use reed_solomon_erasure::{galois_8, ReedSolomon, Error as RSError};
-use image::{ImageBuffer, Rgba, Luma};
-use lopdf::{Document, Object, Dictionary, Stream, content::{Content, Operation}, ObjectId};
-use std::io::Cursor;
+use reed_solomon_erasure::{galois_8, Error as RSError, ReedSolomon};
 use std::fs;
+use std::io::Cursor;
 
 // ... (DrmError, From impls, FileType, detect_file_type are unchanged) ...
 #[derive(Debug)]
@@ -17,20 +20,49 @@ enum DrmError {
     Message(String),
 }
 
-impl From<std::io::Error> for DrmError { fn from(err: std::io::Error) -> DrmError { DrmError::Io(err) } }
-impl From<PyErr> for DrmError { fn from(err: PyErr) -> DrmError { DrmError::Py(err) } }
-impl From<RSError> for DrmError { fn from(err: RSError) -> DrmError { DrmError::Rs(err) } }
-impl From<image::ImageError> for DrmError { fn from(err: image::ImageError) -> DrmError { DrmError::Image(err) } }
-impl From<lopdf::Error> for DrmError { fn from(err: lopdf::Error) -> DrmError { DrmError::Pdf(err) } }
+impl From<std::io::Error> for DrmError {
+    fn from(err: std::io::Error) -> DrmError {
+        DrmError::Io(err)
+    }
+}
+impl From<PyErr> for DrmError {
+    fn from(err: PyErr) -> DrmError {
+        DrmError::Py(err)
+    }
+}
+impl From<RSError> for DrmError {
+    fn from(err: RSError) -> DrmError {
+        DrmError::Rs(err)
+    }
+}
+impl From<image::ImageError> for DrmError {
+    fn from(err: image::ImageError) -> DrmError {
+        DrmError::Image(err)
+    }
+}
+impl From<lopdf::Error> for DrmError {
+    fn from(err: lopdf::Error) -> DrmError {
+        DrmError::Pdf(err)
+    }
+}
 
 impl From<DrmError> for PyErr {
     fn from(err: DrmError) -> PyErr {
         match err {
             DrmError::Io(e) => PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()),
             DrmError::Py(e) => e,
-            DrmError::Rs(e) => PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Reed-Solomon error: {:?}", e)),
-            DrmError::Image(e) => PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Image processing error: {}", e)),
-            DrmError::Pdf(e) => PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("PDF processing error: {}", e)),
+            DrmError::Rs(e) => PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "Reed-Solomon error: {:?}",
+                e
+            )),
+            DrmError::Image(e) => PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "Image processing error: {}",
+                e
+            )),
+            DrmError::Pdf(e) => PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "PDF processing error: {}",
+                e
+            )),
             DrmError::Message(s) => PyErr::new::<pyo3::exceptions::PyValueError, _>(s),
         }
     }
@@ -64,7 +96,9 @@ fn embed_in_png(image_data: &[u8], data_to_embed: &[u8]) -> Result<Vec<u8>, DrmE
         )));
     }
 
-    let mut bit_iter = data_to_embed.iter().flat_map(|byte| (0..8).map(move |i| (byte >> i) & 1));
+    let mut bit_iter = data_to_embed
+        .iter()
+        .flat_map(|byte| (0..8).map(move |i| (byte >> i) & 1));
     let img_buffer = img.as_mut();
 
     for byte_chunk in img_buffer.iter_mut() {
@@ -76,8 +110,11 @@ fn embed_in_png(image_data: &[u8], data_to_embed: &[u8]) -> Result<Vec<u8>, DrmE
     }
 
     let mut result_bytes = Vec::new();
-    img.write_to(&mut Cursor::new(&mut result_bytes), image::ImageOutputFormat::Png)?;
-    
+    img.write_to(
+        &mut Cursor::new(&mut result_bytes),
+        image::ImageOutputFormat::Png,
+    )?;
+
     Ok(result_bytes)
 }
 
@@ -91,7 +128,9 @@ fn extract_from_png(image_data: &[u8]) -> Result<Vec<u8>, DrmError> {
             if let Some(bit) = bit_iter.next() {
                 len_bytes[i] |= bit << j;
             } else {
-                return Err(DrmError::Message("Reached end of image before reading payload length".to_string()));
+                return Err(DrmError::Message(
+                    "Reached end of image before reading payload length".to_string(),
+                ));
             }
         }
     }
@@ -103,12 +142,49 @@ fn extract_from_png(image_data: &[u8]) -> Result<Vec<u8>, DrmError> {
             if let Some(bit) = bit_iter.next() {
                 payload[i] |= bit << j;
             } else {
-                return Err(DrmError::Message("Reached end of image before reading full payload".to_string()));
+                return Err(DrmError::Message(
+                    "Reached end of image before reading full payload".to_string(),
+                ));
             }
         }
     }
 
     Ok(payload)
+}
+
+fn extract_from_pdf(pdf_data: &[u8]) -> Result<Vec<u8>, DrmError> {
+    let doc = Document::load_mem(pdf_data)?;
+    let page_ids = doc.get_pages().values().cloned().collect::<Vec<ObjectId>>();
+    for page_id in page_ids {
+        let page_dict = doc.get_object(page_id)?.as_dict()?;
+        if let Ok(&Object::Reference(res_id)) = page_dict.get(b"Resources") {
+            let resources = doc.get_object(res_id)?.as_dict()?;
+            if let Ok(&Object::Reference(xobj_id)) = resources.get(b"XObject") {
+                let xobjects = doc.get_object(xobj_id)?.as_dict()?;
+                if let Ok(&Object::Reference(img_id)) = xobjects.get(b"UpdrmImg") {
+                    let stream = doc.get_object(img_id)?.as_stream()?;
+                    let img_bytes = stream.content.clone();
+                    let img = image::load_from_memory(&img_bytes)?.to_luma8();
+                    let raw = img.into_raw();
+                    if raw.len() < 8 {
+                        return Err(DrmError::Message("Embedded data too short".to_string()));
+                    }
+                    let mut len_bytes = [0u8; 8];
+                    len_bytes.copy_from_slice(&raw[0..8]);
+                    let payload_len = u64::from_be_bytes(len_bytes) as usize;
+                    if raw.len() < 8 + payload_len {
+                        return Err(DrmError::Message(
+                            "Embedded data length mismatch".to_string(),
+                        ));
+                    }
+                    return Ok(raw[8..8 + payload_len].to_vec());
+                }
+            }
+        }
+    }
+    Err(DrmError::Message(
+        "No embedded data found in PDF".to_string(),
+    ))
 }
 
 fn embed_in_pdf(pdf_data: &[u8], data_to_embed: &[u8]) -> Result<Vec<u8>, DrmError> {
@@ -118,10 +194,17 @@ fn embed_in_pdf(pdf_data: &[u8], data_to_embed: &[u8]) -> Result<Vec<u8>, DrmErr
     let side = (data_to_embed.len() as f64).sqrt().ceil() as u32;
     let noise_img_buffer: ImageBuffer<Luma<u8>, _> = ImageBuffer::from_fn(side, side, |x, y| {
         let index = (y * side + x) as usize;
-        Luma([if index < data_to_embed.len() { data_to_embed[index] } else { 0 }])
+        Luma([if index < data_to_embed.len() {
+            data_to_embed[index]
+        } else {
+            0
+        }])
     });
     let mut noise_png_bytes = vec![];
-    noise_img_buffer.write_to(&mut Cursor::new(&mut noise_png_bytes), image::ImageOutputFormat::Png)?;
+    noise_img_buffer.write_to(
+        &mut Cursor::new(&mut noise_png_bytes),
+        image::ImageOutputFormat::Png,
+    )?;
 
     // 2. Create Image XObject
     let image_xobject = Stream::new(
@@ -151,42 +234,67 @@ fn embed_in_pdf(pdf_data: &[u8], data_to_embed: &[u8]) -> Result<Vec<u8>, DrmErr
                 Ok(Object::Reference(id)) => *id,
                 _ => {
                     let new_res_id = doc.add_object(Dictionary::new());
-                    doc.get_object_mut(page_id)?.as_dict_mut()?.set(b"Resources", new_res_id);
+                    doc.get_object_mut(page_id)?
+                        .as_dict_mut()?
+                        .set(b"Resources", new_res_id);
                     new_res_id
                 }
             }
         };
 
+        let xobject_id = if let Ok(&Object::Reference(id)) =
+            doc.get_object(resources_id)?.as_dict()?.get(b"XObject")
         {
-            let resources = doc.get_object_mut(resources_id)?.as_dict_mut()?;
-            let xobject_id = match resources.get(b"XObject") {
-                Ok(Object::Reference(id)) => *id,
-                _ => {
-                    let new_id = doc.add_object(Dictionary::new());
-                    resources.set(b"XObject", new_id);
-                    new_id
-                }
-            };
-            let gstate_id = match resources.get(b"ExtGState") {
-                Ok(Object::Reference(id)) => *id,
-                _ => {
-                    let new_id = doc.add_object(Dictionary::new());
-                    resources.set(b"ExtGState", new_id);
-                    new_id
-                }
-            };
-            doc.get_object_mut(xobject_id)?.as_dict_mut()?.set(b"UpdrmImg", image_id);
-            doc.get_object_mut(gstate_id)?.as_dict_mut()?.set(b"UpdrmGS", gs_id);
-        }
+            id
+        } else {
+            let new_id = doc.add_object(Dictionary::new());
+            doc.get_object_mut(resources_id)?
+                .as_dict_mut()?
+                .set(b"XObject", new_id);
+            new_id
+        };
+        let gstate_id = if let Ok(&Object::Reference(id)) =
+            doc.get_object(resources_id)?.as_dict()?.get(b"ExtGState")
+        {
+            id
+        } else {
+            let new_id = doc.add_object(Dictionary::new());
+            doc.get_object_mut(resources_id)?
+                .as_dict_mut()?
+                .set(b"ExtGState", new_id);
+            new_id
+        };
+        doc.get_object_mut(xobject_id)?
+            .as_dict_mut()?
+            .set(b"UpdrmImg", image_id);
+        doc.get_object_mut(gstate_id)?
+            .as_dict_mut()?
+            .set(b"UpdrmGS", gs_id);
 
         let content_ops = vec![
             Operation::new("q", vec![]),
             Operation::new("gs", vec![Object::Name(b"UpdrmGS".to_vec())]),
-            Operation::new("cm", vec![10.0.into(), 0.into(), 0.into(), 10.0.into(), 50.into(), 50.into()]),
+            Operation::new(
+                "cm",
+                vec![
+                    10.0.into(),
+                    0.into(),
+                    0.into(),
+                    10.0.into(),
+                    50.into(),
+                    50.into(),
+                ],
+            ),
             Operation::new("Do", vec![Object::Name(b"UpdrmImg".to_vec())]),
             Operation::new("Q", vec![]),
         ];
-        let new_content_stream = Stream::new(Dictionary::new(), Content { operations: content_ops }.encode()?);
+        let new_content_stream = Stream::new(
+            Dictionary::new(),
+            Content {
+                operations: content_ops,
+            }
+            .encode()?,
+        );
         let new_content_id = doc.add_object(new_content_stream);
 
         let page_dict = doc.get_object_mut(page_id)?.as_dict_mut()?;
@@ -204,7 +312,6 @@ fn embed_in_pdf(pdf_data: &[u8], data_to_embed: &[u8]) -> Result<Vec<u8>, DrmErr
     Ok(result_bytes)
 }
 
-
 // ... (write and read functions are unchanged) ...
 #[pyfunction]
 fn write(py: Python, file_path: String, data: &Bound<'_, PyAny>) -> Result<(), DrmError> {
@@ -215,7 +322,11 @@ fn write(py: Python, file_path: String, data: &Bound<'_, PyAny>) -> Result<(), D
     } else if let Ok(bytes) = data.extract::<Vec<u8>>() {
         bytes
     } else {
-        return Err(DrmError::Py(PyErr::new::<pyo3::exceptions::PyTypeError, _>("Data must be a string (JSON) or bytes (image)".to_string())));
+        return Err(DrmError::Py(
+            PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                "Data must be a string (JSON) or bytes (image)".to_string(),
+            ),
+        ));
     };
 
     let len_bytes = (raw_data.len() as u32).to_be_bytes();
@@ -228,7 +339,9 @@ fn write(py: Python, file_path: String, data: &Bound<'_, PyAny>) -> Result<(), D
     let shard_len = (full_data.len() + DATA_SHARDS - 1) / DATA_SHARDS;
     let mut shards: Vec<Vec<u8>> = full_data.chunks(shard_len).map(|c| c.to_vec()).collect();
     shards.iter_mut().for_each(|s| s.resize(shard_len, 0));
-    for _ in 0..PARITY_SHARDS { shards.push(vec![0; shard_len]); }
+    for _ in 0..PARITY_SHARDS {
+        shards.push(vec![0; shard_len]);
+    }
     rs.encode(&mut shards)?;
     let encoded_data: Vec<u8> = shards.into_iter().flatten().collect();
 
@@ -236,13 +349,17 @@ fn write(py: Python, file_path: String, data: &Bound<'_, PyAny>) -> Result<(), D
     final_payload.extend_from_slice(&encoded_data);
 
     let original_file_bytes = fs::read(&file_path)?;
-    
+
     let file_type = detect_file_type(&original_file_bytes);
 
     let modified_file_bytes = match file_type {
         FileType::Png => embed_in_png(&original_file_bytes, &final_payload)?,
         FileType::Pdf => embed_in_pdf(&original_file_bytes, &final_payload)?,
-        FileType::Unsupported => return Err(DrmError::Message("Unsupported file type. Only PNG and PDF are supported.".to_string())),
+        FileType::Unsupported => {
+            return Err(DrmError::Message(
+                "Unsupported file type. Only PNG and PDF are supported.".to_string(),
+            ))
+        }
     };
 
     fs::write(&file_path, &modified_file_bytes)?;
@@ -257,34 +374,51 @@ fn read(py: Python, file_path: String) -> Result<PyObject, DrmError> {
 
     let encoded_data = match file_type {
         FileType::Png => extract_from_png(&file_bytes)?,
-        FileType::Pdf => return Err(DrmError::Message("PDF extraction is not yet implemented.".to_string())),
-        FileType::Unsupported => return Err(DrmError::Message("Unsupported file type for extraction.".to_string())),
+        FileType::Pdf => extract_from_pdf(&file_bytes)?,
+        FileType::Unsupported => {
+            return Err(DrmError::Message(
+                "Unsupported file type for extraction.".to_string(),
+            ))
+        }
     };
 
     const DATA_SHARDS: usize = 10;
     const PARITY_SHARDS: usize = 4;
     let rs = ReedSolomon::<galois_8::Field>::new(DATA_SHARDS, PARITY_SHARDS)?;
     let shard_len = encoded_data.len() / (DATA_SHARDS + PARITY_SHARDS);
-    let mut shards: Vec<Option<Vec<u8>>> = encoded_data.chunks(shard_len).map(|c| Some(c.to_vec())).collect();
+    let mut shards: Vec<Option<Vec<u8>>> = encoded_data
+        .chunks(shard_len)
+        .map(|c| Some(c.to_vec()))
+        .collect();
 
     rs.reconstruct(&mut shards)?;
 
-    let full_data: Vec<u8> = shards.into_iter().take(DATA_SHARDS).filter_map(|s| s).flatten().collect();
+    let full_data: Vec<u8> = shards
+        .into_iter()
+        .take(DATA_SHARDS)
+        .filter_map(|s| s)
+        .flatten()
+        .collect();
 
     if full_data.len() < 4 {
-        return Err(DrmError::Message("Reconstructed data is too short to contain length header.".to_string()));
+        return Err(DrmError::Message(
+            "Reconstructed data is too short to contain length header.".to_string(),
+        ));
     }
-    let len_bytes: [u8; 4] = full_data[0..4].try_into().map_err(|_| DrmError::Message("Failed to read data length from payload".to_string()))?;
+    let len_bytes: [u8; 4] = full_data[0..4]
+        .try_into()
+        .map_err(|_| DrmError::Message("Failed to read data length from payload".to_string()))?;
     let raw_data_len = u32::from_be_bytes(len_bytes) as usize;
 
     if full_data.len() < 4 + raw_data_len {
-        return Err(DrmError::Message("Reconstructed data is shorter than specified by its length header.".to_string()));
+        return Err(DrmError::Message(
+            "Reconstructed data is shorter than specified by its length header.".to_string(),
+        ));
     }
     let raw_data = &full_data[4..(4 + raw_data_len)];
 
     Ok(PyBytes::new_bound(py, raw_data).into())
 }
-
 
 #[pymodule]
 fn mirseo_updrm(m: &Bound<'_, PyModule>) -> PyResult<()> {
